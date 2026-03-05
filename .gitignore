@@ -175,3 +175,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+metrabs_eff2s_y4_256px_1600k_28ds/**
+*.npz
+*.mp4
