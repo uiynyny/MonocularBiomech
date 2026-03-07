@@ -213,7 +213,7 @@ def process_videos_with_biomechanics(
         model,
         dataset,
         lr_init_value=1e-3,
-        max_iters=max_iters,
+        max_iters=5000,
         step_callback=step_callback,
     )
     progress(1.0, desc="Biomechanics model fit successfully.")

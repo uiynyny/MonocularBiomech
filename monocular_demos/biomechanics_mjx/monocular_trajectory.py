@@ -722,54 +722,82 @@ def fit_model(
     model_device = list(model.scale_mixer.devices())[0]
     local_fetch_data = jax.jit(functools.partial(fetch_data, dataset=dataset, N=N, model_device=model_device))
 
-    smoothed_metrics = None
+    # Run first step to initialize smoothed_metrics and other states
+    data_0 = local_fetch_data(jnp.array(0))
+    val, model, opt_state, metrics = step(model, opt_state, data_0, loss_grad, optimizer)
+    smoothed_metrics = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), metrics)
 
-    @jax.jit
-    def update_metrics(new_metrics, old_metrics):
-        new_metrics_reduced = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), new_metrics)
+    if step_callback is not None:
+        step_callback(0, model, dataset, {**metrics, "learning_rate": learning_rate(0)})
 
-        # Function to check if the structures are the same
-        def is_same_structure(x, y):
-            if isinstance(x, dict) and isinstance(y, dict):
-                if x.keys() != y.keys():
-                    return False
-                return all(is_same_structure(x[k], y[k]) for k in x)
-            return type(x) == type(y)
+    # Unroll remaining steps to avoid extreme Python overhead during dispatch
+    K_steps = 50
 
-        if old_metrics is None or not is_same_structure(new_metrics_reduced, old_metrics):
-            return new_metrics_reduced
+    @eqx.filter_jit
+    def run_K_steps(m_init, opt_init, sm_init, i_start):
+        m_dyn, m_stat = eqx.partition(m_init, eqx.is_array)
+        opt_dyn, opt_stat = eqx.partition(opt_init, eqx.is_array)
+        
+        def scan_fn(carry_dyn, i):
+            m_d, opt_d, sm_c = carry_dyn
+            m_c = eqx.combine(m_d, m_stat)
+            opt_c = eqx.combine(opt_d, opt_stat)
+            
+            data = local_fetch_data(i)
+            val_c, next_m, next_opt, next_metrics = step(m_c, opt_c, data, loss_grad, optimizer)
+            
+            new_metrics_reduced = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), next_metrics)
+            next_sm = jax.tree_util.tree_map(lambda x, y: 0.9 * x + 0.1 * y, sm_c, new_metrics_reduced)
+            
+            next_m_d, _ = eqx.partition(next_m, eqx.is_array)
+            next_opt_d, _ = eqx.partition(next_opt, eqx.is_array)
+            
+            return (next_m_d, next_opt_d, next_sm), (val_c, next_metrics)
+        
+        indices = jnp.arange(K_steps) + i_start
+        (m_final_d, opt_final_d, sm_final), (vals, metrics_history) = jax.lax.scan(
+            scan_fn, (m_dyn, opt_dyn, sm_init), indices)
+        
+        m_final = eqx.combine(m_final_d, m_stat)
+        opt_final = eqx.combine(opt_final_d, opt_stat)
+        
+        last_val = vals[-1]
+        last_metrics = jax.tree_util.tree_map(lambda x: x[-1], metrics_history)
+        return m_final, opt_final, sm_final, last_val, last_metrics
+
+    from tqdm import tqdm
+    counter = tqdm(total=max_iters - 1)
+    
+    for i in range(1, max_iters, K_steps):
+        end_i = min(i + K_steps, max_iters)
+        current_K = end_i - i
+        
+        if current_K == K_steps:
+            model, opt_state, smoothed_metrics, val, metrics = run_K_steps(model, opt_state, smoothed_metrics, jnp.array(i))
         else:
-            return jax.tree_util.tree_map(lambda x, y: 0.9 * x + 0.1 * y, old_metrics, new_metrics_reduced)
+            # Fallback for cleanly finishing iter counts not divisible by K_steps
+            for j in range(i, end_i):
+                data = local_fetch_data(jnp.array(j))
+                val, model, opt_state, metrics = step(model, opt_state, data, loss_grad, optimizer)
+                new_metrics_reduced = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), metrics)
+                smoothed_metrics = jax.tree_util.tree_map(lambda x, y: 0.9 * x + 0.1 * y, smoothed_metrics, new_metrics_reduced)
 
-    counter = trange(max_iters)
-    for i in counter:
-        data = local_fetch_data(jnp.array(i))
-        val, model, opt_state, metrics = step(model, opt_state, data, loss_grad, optimizer)
-        if i == 1000:
+        if end_i - 1 >= 1000 and i <= 1000:
             if jnp.isnan(val):
-                raise ValueError(f"Loss is NaN on iteration {i}.")
-
-        smoothed_metrics = update_metrics(metrics, smoothed_metrics)
+                raise ValueError(f"Loss is NaN near iteration 1000.")
 
         if step_callback is not None:
-            step_callback(i, model, dataset, {**metrics, "learning_rate": learning_rate(i)})
+            step_callback(end_i - 1, model, dataset, {**metrics, "learning_rate": learning_rate(end_i - 1)})
 
-        if i > 0 and i % int(max_iters // 10) == 0:
-            display_metrics = smoothed_metrics
-            print(f"iter: {i} loss: {val}.")  # metrics: {metrics}")
+        if (end_i - 1) % int(max_iters // 10) == 0:
+            print(f"iter: {end_i - 1} loss: {val}.")
 
-        if i % 50 == 0:
-            # now round all of them to three decimal places
-            # metrics = {k: round(v, 3) for k, v in metrics.items()}
-            display_metrics = {k: v.item() for k, v in smoothed_metrics.items()}
+        display_metrics = {k: v.item() for k, v in smoothed_metrics.items()}
+        ordered_display_metrics = OrderedDict(
+            sorted(display_metrics.items(), key=lambda x: x[0] not in ["total", "mean_3d_raw", "site_offset_raw"])
+        )
+        counter.set_postfix(ordered_display_metrics)
+        counter.update(current_K)
 
-            # make this an OrderedDict and make sure "loss" is the first element, followed by "mean_reprojection" and then the rest
-            ordered_display_metrics = OrderedDict(
-                sorted(display_metrics.items(), key=lambda x: x[0] not in ["total", "mean_3d_raw", "site_offset_raw"])
-            )
-            counter.set_postfix(ordered_display_metrics)
-
-            if i % int(max_iters // 10) == 0:
-                print(display_metrics)
-
+    counter.close()
     return model, metrics
