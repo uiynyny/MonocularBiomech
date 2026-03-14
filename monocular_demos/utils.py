@@ -84,9 +84,24 @@ def load_metrabs():
     import onnxruntime as ort
     from metrabs_tf.multiperson.multiperson_model import Pose3dEstimator
     import simplepyutils as spu
+    import pickle
+    import os
 
-    print("Loading Original TF Model...")
-    tf_model = tf.saved_model.load('metrabs_eff2s_y4_256px_1600k_28ds')
+    print("Loading Metadata and Detector...")
+    with open('metrabs_metadata.pkl', 'rb') as f:
+        metadata = pickle.load(f)
+        
+    class CropModelDummy:
+        def __init__(self, metadata):
+            self.input_resolution = metadata['input_resolution']
+            self.joint_names = np.array([b.encode('utf8') for b in metadata['joint_names']])
+            self.joint_edges = np.array(metadata['joint_edges'])
+            if 'recombination_weights' in metadata:
+                self.recombination_weights = tf.constant(metadata['recombination_weights'])
+
+    dummy_crop = CropModelDummy(metadata)
+    
+    tf_detector = tf.saved_model.load('metrabs_detector')
     
     class ONNXCropModel(tf.Module):
         def __init__(self, crop_model, onnx_model_path):
@@ -94,15 +109,15 @@ def load_metrabs():
             self.input_resolution = crop_model.input_resolution
             self.joint_names = crop_model.joint_names
             self.joint_edges = crop_model.joint_edges
-            self.sess = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
+            
+            sess_options = ort.SessionOptions()
+            sess_options.intra_op_num_threads = os.cpu_count() or 8
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            self.sess = ort.InferenceSession(onnx_model_path, sess_options, providers=['CPUExecutionProvider'])
             
             # Extract weights for post-processing if any
             if hasattr(crop_model, "recombination_weights"):
                 self.recombination_weights = crop_model.recombination_weights
-            else:
-                for v in crop_model.variables:
-                    if 'recombination_weights' in v.name:
-                        self.recombination_weights = v
 
         def backbone_and_head(self, image, training=False):
             # Run the ONNX model which outputs the heatmaps
@@ -112,13 +127,6 @@ def load_metrabs():
             
             head_a, head_b = tf.py_function(_ort_run, [image], [tf.float32, tf.float32])
             
-            # The shapes are typically [B, 256, 256, 2] and [B, 256, 256, 3] or similar, but tf.py_function loses them.
-            # We can't know which is 2d or 3d until we inspect shape, but tf.py_function is dynamic.
-            # However, from our ONNX tests, out1 is coords2d and out2 is coords3d if we check dimensions.
-            # Heatmap 2D has shape (B, J, 2)
-            # Heatmap 3D has shape (B, J, 3)
-            # We can use tf.cond or just assume the order based on ONNX outputs.
-            # metrabs_backbone.onnx out1 is usually 2d
             return None, head_a, head_b
 
         def latent_points_to_joints(self, points):
@@ -156,21 +164,19 @@ def load_metrabs():
             return self.predict_multi(inp[0], inp[1])
             
     print("Building ONNX Crop Model Wrapper...")
-    onnx_crop = ONNXCropModel(tf_model.crop_model, "metrabs_backbone.onnx")
+    onnx_crop = ONNXCropModel(dummy_crop, "metrabs_backbone.onnx")
     
     # We need skeleton_infos. They are in the SavedModel. 
     # Pose3dEstimator expects a dict of {name: {'indices': ..., 'names': ..., 'edges': ...}}
     skeleton_infos = {}
-    for skel in tf_model.per_skeleton_indices:
+    for skel, v in metadata['skeleton_infos'].items():
         skeleton_infos[skel] = {
-            'indices': tf_model.per_skeleton_indices[skel].numpy(),
-            'names': [b.decode('utf8') for b in tf_model.per_skeleton_joint_names[skel].numpy()],
-            'edges': tf_model.per_skeleton_joint_edges[skel].numpy()
+            'indices': v['indices'],
+            'names': v['names'],
+            'edges': v['edges']
         }
 
     # Transform matrix
-    # The original saved model has no direct joint_transform_matrix exposed, usually it's None.
-    # From Pose3dEstimator init, it's None by default.
     joint_transform_matrix = None
     
     # Initialize necessary FLAGS for inference
@@ -191,7 +197,7 @@ def load_metrabs():
     print("Wiring Pose3dEstimator with ONNX and TensorFlow...")
     pipeline = Pose3dEstimator(
         crop_model=onnx_crop,
-        detector=tf_model.detector,
+        detector=tf_detector,
         skeleton_infos=skeleton_infos,
         joint_transform_matrix=joint_transform_matrix
     )

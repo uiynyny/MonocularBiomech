@@ -1,7 +1,16 @@
-from monocular_demos.utils import jax_memory_limit, tensorflow_memory_limit
-tensorflow_memory_limit()
-jax_memory_limit()
 import os
+os.environ["MUJOCO_GL"] = "egl"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress most TF logs including CUDA initialization errors
+os.environ["TF_XLA_FLAGS"] = "--tf_xla_cpu_global_jit"
+
+from monocular_demos.utils import jax_memory_limit, tensorflow_memory_limit
+# tensorflow_memory_limit()  # No longer needed as we force CPU
+jax_memory_limit()
+
 from typing import List
 
 import cv2
@@ -11,6 +20,8 @@ import jax.numpy as jnp
 import numpy as np
 import plotly.graph_objects as go
 import tensorflow as tf
+from tqdm import tqdm
+import time
 from monocular_demos.biomechanics_mjx.forward_kinematics import ForwardKinematics
 from monocular_demos.biomechanics_mjx.visualize import render_trajectory
 from monocular_demos.biomechanics_mjx.monocular_trajectory import (
@@ -29,9 +40,9 @@ jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 jax.config.update("jax_enable_x64", True)
 
+METRABS_CACHE = {}
 
-def save_metrabs_data(accumulated, video_name):
-    fname = video_name.split("/")[-1].split(".")[0]
+def save_metrabs_data(accumulated, video_path):
     boxes, pose3d, pose2d, confs = [], [], [], []
     for i, (box, p3d, p2d) in enumerate(
         zip(accumulated["boxes"], accumulated["poses3d"], accumulated["poses2d"])
@@ -49,8 +60,12 @@ def save_metrabs_data(accumulated, video_name):
         pose2d.append(p2d[0].numpy())
         confs.append(np.ones((87)))
 
-        with open(f"{fname}_keypoints.npz", "wb") as f:
-            np.savez(f, keypoints3d=pose3d, keypoints2d=pose2d, boxes=boxes, confs=confs)
+    METRABS_CACHE[video_path] = {
+        "boxes": np.array(boxes),
+        "keypoints2d": np.array(pose2d),
+        "keypoints3d": np.array(pose3d),
+        "confs": np.array(confs)
+    }
 
 def render_mjx(selected_file, progress=gr.Progress()):
     """Load saved data and create visualizations"""
@@ -83,8 +98,6 @@ def render_mjx(selected_file, progress=gr.Progress()):
 
     return result_text, video_filename
 
-
-
 def get_framerate(video_path):
     """
     Get the framerate of a video file.
@@ -97,9 +110,12 @@ def get_framerate(video_path):
     cap.release()
     return fps
 
-
-def load_metrabs_data(video_name):
-    fname = video_name.split("/")[-1].split(".")[0]
+def load_metrabs_data(video_path):
+    if video_path in METRABS_CACHE:
+        data = METRABS_CACHE[video_path]
+        return data["boxes"], data["keypoints2d"], data["keypoints3d"], data["confs"]
+    
+    fname = video_path.split("/")[-1].split(".")[0]
     try:
         with open(f"{fname}_keypoints.npz", "rb") as f:
             data = np.load(f, allow_pickle=True)
@@ -113,7 +129,6 @@ def load_metrabs_data(video_name):
         print("No saved data found for this video.")
         return None, None, None, None
 
-
 def process_videos_with_metrabs(
     video_files: List[str],
     progress=gr.Progress(),
@@ -125,32 +140,39 @@ def process_videos_with_metrabs(
         return "No videos uploaded."
 
     progress(0, desc="Loading model (takes 3 minutes)...")
+    start_time = time.time()
     model = load_metrabs()
+    end_time = time.time()
+    print(f"Model loaded successfully in {end_time - start_time} seconds.")
     progress(0.1, desc="Model loaded successfully.")
     skeleton = "bml_movi_87"
 
     video_count = 0
     for video_idx, video_path in enumerate(video_files):
         if video_path is not None:
+            start_time = time.time()
             vid, n_frames = video_reader(video_path)
-            accumulated = None
-            for frame_idx, frame_batch in enumerate(vid):
+            accumulated_list = []
+            for frame_idx, frame_batch in tqdm(enumerate(vid), total=n_frames/8):
                 progress(
                     frame_idx * 8 / n_frames, desc=f"Processing video {video_idx+1}"
                 )
 
                 pred = model.detect_poses_batched(frame_batch, skeleton=skeleton)
+                accumulated_list.append(pred)
 
-                if accumulated is None:
-                    accumulated = pred
+            if len(accumulated_list) > 0:
+                accumulated = {}
+                for key in accumulated_list[0].keys():
+                    accumulated[key] = tf.concat(
+                        [item[key] for item in accumulated_list], axis=0
+                    )
+            else:
+                accumulated = None
 
-                else:
-                    # concatenate the ragged tensor along the batch for each element in the dictionary
-                    for key in accumulated.keys():
-                        accumulated[key] = tf.concat(
-                            [accumulated[key], pred[key]], axis=0
-                        )
             save_metrabs_data(accumulated, video_path)
+            end_time = time.time()
+            print(f"Video {video_idx+1} processed successfully in {end_time - start_time} seconds.")
             video_count += 1
 
     return f"Successfully processed {video_count} videos with Metrabs."
@@ -203,6 +225,7 @@ def process_videos_with_biomechanics(
         keypoint_confidence=confs_list,
         camera_params=get_samsung_calibration(),
         phone_attitude=None,
+        sample_length=128,
     )
 
     progress(0, desc="Building biomechanics model...")
@@ -213,7 +236,7 @@ def process_videos_with_biomechanics(
         model,
         dataset,
         lr_init_value=1e-3,
-        max_iters=5000,
+        max_iters=2000,
         step_callback=step_callback,
     )
     progress(1.0, desc="Biomechanics model fit successfully.")

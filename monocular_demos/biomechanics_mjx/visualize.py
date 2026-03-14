@@ -126,7 +126,10 @@ def render_trajectory(
 
         else:
             data.qpos = pose[i]
-            mujoco.mj_forward(model, data)
+            if show_grfs or (actuators is not None):
+                mujoco.mj_forward(model, data)
+            else:
+                mujoco.mj_kinematics(model, data)
 
         if i == 0:
             camera.lookat = data.xpos[1]
@@ -208,7 +211,7 @@ def render_tiled(
     def render_pose_idx(pose, idx):
         idx = idx % len(pose)
         data.qpos = pose[idx]
-        mujoco.mj_forward(model, data)
+        mujoco.mj_kinematics(model, data)
         camera.lookat = data.xpos[1]
         renderer.update_scene(data, camera=camera, scene_option=scene_option)
         return renderer.render()

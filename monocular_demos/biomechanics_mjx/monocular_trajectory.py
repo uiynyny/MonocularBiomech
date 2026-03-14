@@ -768,6 +768,10 @@ def fit_model(
     from tqdm import tqdm
     counter = tqdm(total=max_iters - 1)
     
+    best_loss = float('inf')
+    patience_counter = 0
+    PATIENCE_LIMIT = 5  # Stop if loss doesn't improve by at least 1e-3 for 5 outer K_steps (50 step spans)
+    
     for i in range(1, max_iters, K_steps):
         end_i = min(i + K_steps, max_iters)
         current_K = end_i - i
@@ -798,6 +802,18 @@ def fit_model(
         )
         counter.set_postfix(ordered_display_metrics)
         counter.update(current_K)
+        
+        # Early Stopping Check
+        current_loss = val.item() if hasattr(val, "item") else float(val)
+        if best_loss - current_loss > 1e-3:
+            best_loss = current_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= PATIENCE_LIMIT:
+            print(f"Early stopping triggered at step {end_i - 1}. Loss plateaued at {current_loss}.")
+            break
 
     counter.close()
-    return model, metrics
+    return model, display_metrics

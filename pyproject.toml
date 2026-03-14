@@ -6,7 +6,7 @@ name = "monocular_demos"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "gradio",
     "plotly",
@@ -18,10 +18,17 @@ dependencies = [
     "mujoco-mjx",
     "opencv-python",
     "optax",
-    "tensorflow>=2.20.0",
+    "tensorflow>=2.20.0,<2.21",
+    "tf-keras>=2.20.0,<2.21",
     "matplotlib>=3.10.8",
     "setuptools==70.0.0",
     "ipykernel>=7.2.0",
+    "onnxruntime>=1.24.3",
+    "simplepyutils>=0.2.1",
+    "more-itertools>=10.8.0",
+    "addict>=2.4.0",
+    "einops>=0.8.2",
+    "tensorflow-graphics>=2020.5.20",
 ]
 
 [dependency-groups]

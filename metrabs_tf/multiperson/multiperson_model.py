@@ -22,8 +22,8 @@ class Pose3dEstimator(tf.Module):
         self.crop_model = crop_model
         self.joint_names = self.crop_model.joint_names
         self.joint_edges = self.crop_model.joint_edges
-        joint_names = [b.decode('utf8') for b in self.joint_names.numpy()]
-        self.joint_info = JointInfo(joint_names, self.joint_edges.numpy())
+        joint_names = [b.decode('utf8') for b in self.joint_names]
+        self.joint_info = JointInfo(joint_names, self.joint_edges)
         self.detector = detector
         self.joint_transform_matrix = joint_transform_matrix
 
