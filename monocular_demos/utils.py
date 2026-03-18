@@ -1,17 +1,20 @@
+import os
 import cv2
 import numpy as np
-from tqdm import tqdm
-import tensorflow_hub as hub
 import tensorflow as tf
+from tqdm import tqdm
+import onnxruntime as ort
+import simplepyutils as spu
+import pickle
+from metrabs_tf import tfu3d
+from metrabs_tf.multiperson.multiperson_model import Pose3dEstimator
 
 def jax_memory_limit():
-    import os
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 def tensorflow_memory_limit():
     # limit tensorflow memory. there are also other approaches
     # https://www.tensorflow.org/guide/gpu#limiting_gpu_memory_growth
-    import tensorflow as tf
 
     gpus = tf.config.list_physical_devices("GPU")
     if gpus:
@@ -81,11 +84,7 @@ def video_reader(filename: str, batch_size: int = 8, width: int | None = None):
 def load_metrabs():
     if load_metrabs.model is not None:
         return load_metrabs.model
-    import onnxruntime as ort
-    from metrabs_tf.multiperson.multiperson_model import Pose3dEstimator
-    import simplepyutils as spu
-    import pickle
-    import os
+    
 
     print("Loading Metadata and Detector...")
     with open('metrabs_metadata.pkl', 'rb') as f:
@@ -130,14 +129,12 @@ def load_metrabs():
             return None, head_a, head_b
 
         def latent_points_to_joints(self, points):
-            from metrabs_tf import tfu3d
             return tfu3d.linear_combine_points(points, self.recombination_weights)
 
         @tf.function(input_signature=[
             tf.TensorSpec(shape=(None, None, None, 3), dtype=tf.float16),
             tf.TensorSpec(shape=(None, 3, 3), dtype=tf.float32)])
         def predict_multi(self, image, intrinsic_matrix):
-            from metrabs_tf import tfu3d
             # Emulate the call() method of Metrabs crop model
             _, head_a, head_b = self.backbone_and_head(image, False)
             
