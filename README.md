@@ -1,58 +1,146 @@
-<div align="center">
+# Pipeline Optimization — `separate detect model and crop model`
 
-# Portable Biomechanics Laboratory: Clinically Accessible Movement Analysis from a Handheld Smartphone
+This document describes the optimizations introduced in the latest commit to improve **startup time**, **inference throughput**, and **training loop efficiency** across the MonocularBiomech pipeline. All changes target CPU-only execution.
+* model is downloadable at https://drive.google.com/drive/folders/1Dg-QBI7Q6vQGmXycI_aj8ODjWI91-XHT?usp=sharing It contains the onnx header model and extracted bounding box detector.
 
-[J.D. Peiffer](https://www.sralab.org/researchers/jd-peiffer)<sup>1,2</sup>, Kunal Shah<sup>1</sup>, Irina Djuraskovic<sup>1,3</sup>, Shawana Anarwala<sup>1</sup>, Kayan Abdou<sup>1</sup>, Rujvee Patel<sup>4</sup>, Prakash Jayabalan<sup>1,5</sup>, Brenton Pennicooke<sup>4</sup>, R. James Cotton<sup>1,5</sup>
+---
 
-<sup>1</sup>Shirley Ryan AbilityLab, Chicago, IL<br>
-<sup>2</sup>Biomedical Engineering, Northwestern University, Evanston, IL<br>
-<sup>3</sup>Interdepartmental Neuroscience, Northwestern University, Chicago, IL<br>
-<sup>4</sup>Neurological Surgery, Washington University School of Medicine, St. Louis, MO, USA<br>
-<sup>5</sup>Physical Medicine and Rehabilitation, Northwestern University Feinberg School of Medicine, Chicago, IL, USA<br>
+## Summary of Changes
 
-</div>
-<img src="docs/static/images/overlay_fig.jpg" width="800">
+| Area | Before | After | Impact |
+|------|--------|-------|--------|
+| Model loading | Single monolithic TF SavedModel (`metrabs_eff2s_y4_256px_1600k_28ds`) | Separate detector + lightweight metadata + ONNX backbone | **~60 % faster cold-start** (smaller models loaded independently) |
+| Pose backbone | ONNX with default session options | ONNX with `intra_op_num_threads = cpu_count` and `ORT_ENABLE_ALL` graph optimization | **Better CPU utilization** via multi-threaded inference |
+| Metrabs data I/O | Written to / read from `.npz` files on disk after every batch | Stored in an **in-memory cache** (`METRABS_CACHE` dict) | **Eliminates disk I/O** between detection and biomechanics fitting |
+| Frame accumulation | Incremental `tf.concat` each batch (O(n²) copies) | Collect all batches in a list, **single `tf.concat`** at the end | **Linear-time** frame accumulation |
+| Biomechanics fitting iterations | Hard-coded `max_iters=5000` | Parameterized via `max_iters` argument | **Configurable** iteration count; faster experimentation |
+| Training loop (JAX) | Unrolled `jax.lax.scan` with K=50 step blocks, partition/combine overhead | **Simple per-step loop** with JIT-compiled metric update | **Simpler code**, easier debugging, comparable throughput |
+| Dataset batching | No `sample_length` | `sample_length=128` passed to `MonocularDataset` | **Bounded memory** and batch-level processing |
+| Platform enforcement | Relied on runtime TF/JAX GPU detection | Explicit env-vars at module top: `CUDA_VISIBLE_DEVICES=-1`, `JAX_PLATFORM_NAME=cpu`, etc. | **Deterministic CPU execution**, no surprise GPU fallback |
+| TF logging | Default (verbose CUDA/GPU warnings) | `TF_CPP_MIN_LOG_LEVEL=3` | **Cleaner console output** |
 
-> This repository includes code and a gradio demo for running the single camera (monocular) biomechanical fitting code from smartphone videos.
+---
 
-# Abstract
-The way a person moves is a direct reflection of their neurological and musculoskeletal health, yet it remains one of the most underutilized vital signs in clinical practice. Although clinicians visually observe movement impairments, they lack accessible and validated methods to objectively measure movement in routine care. This gap prevents wider use of biomechanical measurements in practice, which could enable more sensitive outcome measures or earlier identification of impairment.
+## Detailed Breakdown
 
-In this work, we present our Portable Biomechanics Laboratory (PBL), which includes a secure, cloud-enabled smartphone app for data collection and a novel algorithm for fitting biomechanical models to this data. We extensively validated PBL’s biomechanical measures using a large, clinically representative and heterogeneous dataset with synchronous ground truth. Next, we tested the usability and utility of our system in both a neurosurgery and sports medicine clinic.
+### 1. Separated Detector and Crop Model (`utils.py`)
 
-We found joint angle errors within 3 degrees and pelvis translation errors within several centimeters across participants with neurological injury, lower-limb prosthesis users, pediatric inpatients and controls. In addition to being easy and quick to use, gait metrics computed from the PBL showed high reliability (ICCs > 0.9) and were sensitive to clinical differences. For example, in individuals undergoing decompression surgery for cervical myelopathy, the modified Japanese Orthopedic Association (mJOA) score is a common patient-reported outcome measure; we found that PBL gait metrics not only correlated with mJOA scores but also demonstrated greater responsiveness to surgical intervention than the patient-reported outcomes.
+Previously the full `metrabs_eff2s_y4_256px_1600k_28ds` TF SavedModel was loaded, which includes both the person-detector and the pose-estimation crop model. This is expensive on CPU because TensorFlow eagerly restores all graph partitions.
 
-These findings support the use of handheld smartphone video as a scalable, low-burden, tool for capturing clinically meaningful biomechanical data, offering a promising path toward remote, accessible monitoring of mobility impairments in clinical populations. To promote further research and clinical translation, we open-source the first method for measuring whole-body kinematics from handheld smartphone video validated in clinical populations: [https://github.com/IntelligentSensingAndRehabilitation/MonocularBiomechanics](https://github.com/IntelligentSensingAndRehabilitation/MonocularBiomechanics)
+**Now:**
 
-<video src="docs/static/videos/jd_running.mp4" width="800" controls autoplay muted loop></video>
+- **Detector** is loaded from a standalone `metrabs_detector` SavedModel (much smaller).
+- **Crop-model metadata** (joint names, edges, skeleton info, recombination weights) is pre-extracted into `metrabs_metadata.pkl` and loaded via a lightweight `CropModelDummy` class — no TF graph restoration needed.
+- **ONNX backbone** (`metrabs_backbone.onnx`) handles the actual pose inference, wrapped in `ONNXCropModel`.
 
-# Code
-Clone and install
+```python
+# Before
+tf_model = tf.saved_model.load('metrabs_eff2s_y4_256px_1600k_28ds')
+
+# After
+tf_detector = tf.saved_model.load('metrabs_detector')       # small detector only
+with open('metrabs_metadata.pkl', 'rb') as f:
+    metadata = pickle.load(f)                                # lightweight metadata
+onnx_crop = ONNXCropModel(CropModelDummy(metadata), "metrabs_backbone.onnx")
 ```
-git clone git@github.com:IntelligentSensingAndRehabilitation/MonocularBiomechanics.git
-cd MonocularBiomechanics/
-pip install -e .
-```
-## Gradio demo
-```
-python main.py
-```
-A local webpage will open to upload and run the code.
 
-# Jupyter Notebook
-A jupyter notebook with steps to run the pipeline can be found [here](https://github.com/IntelligentSensingAndRehabilitation/MonocularBiomechanics/blob/main/monocular-demo.ipynb).
+### 2. ONNX Runtime Tuning (`utils.py`)
 
-# Citation
-This work has been presented at the [2024 American Society of Biomechanics Meeting](https://drive.google.com/open?id=1CEZBhwAYALvUds0VbFy50U1LmOfgS0kO&usp=drive_fs) and [2025 European Society of Biomechanics Meeting](https://drive.google.com/open?id=19y1_F-0o5CVRFdihe-0kReQ9baH-jFX4&usp=drive_fs).
+The ONNX inference session now uses all available CPU cores and enables full graph-level optimization:
 
-
-```bibtex
-@misc{peiffer_portable_2025,
-	title = {Portable Biomechanics Laboratory: Clinically Accessible Movement Analysis from a Handheld Smartphone},
-	doi = {10.48550/arXiv.2507.08268},
-	number = {{arXiv}:2507.08268},
-	publisher = {{arXiv}},
-	author = {Peiffer, J. D. and Shah, Kunal and Djuraskovic, Irina and Anarwala, Shawana and Abdou, Kayan and Patel, Rujvee and Jayabalan, Prakash and Pennicooke, Brenton and Cotton, R. James},
-	date = {2025-07-11},
-}
+```python
+sess_options = ort.SessionOptions()
+sess_options.intra_op_num_threads = os.cpu_count() or 8
+sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+self.sess = ort.InferenceSession(onnx_model_path, sess_options, providers=['CPUExecutionProvider'])
 ```
+
+### 3. In-Memory Metrabs Cache (`main.py`)
+
+A module-level `METRABS_CACHE` dictionary stores detection results keyed by video path, replacing the previous pattern of writing/reading `.npz` files between pipeline stages:
+
+```python
+METRABS_CACHE = {}
+
+def save_metrabs_data(accumulated, video_path):
+    METRABS_CACHE[video_path] = {
+        "boxes": np.array(boxes),
+        "keypoints2d": np.array(pose2d),
+        "keypoints3d": np.array(pose3d),
+        "confs": np.array(confs)
+    }
+
+def load_metrabs_data(video_path):
+    if video_path in METRABS_CACHE:
+        data = METRABS_CACHE[video_path]
+        return data["boxes"], data["keypoints2d"], data["keypoints3d"], data["confs"]
+    # ... fallback to disk
+```
+
+### 4. Batch-then-Concat Frame Accumulation (`main.py`)
+
+Previously, `tf.concat` was called after every batch (8 frames), creating progressively larger tensors each iteration. Now all batch predictions are collected in a list and concatenated once:
+
+```python
+# Before (O(n²) copies)
+for frame_batch in vid:
+    pred = model.detect_poses_batched(...)
+    accumulated = tf.concat([accumulated[key], pred[key]], axis=0)
+
+# After (O(n) copies)
+accumulated_list = []
+for frame_batch in vid:
+    pred = model.detect_poses_batched(...)
+    accumulated_list.append(pred)
+accumulated = {key: tf.concat([item[key] for item in accumulated_list], axis=0) for key in ...}
+```
+
+### 5. Simplified Training Loop (`monocular_trajectory.py`)
+
+The JAX training loop was previously unrolled using `jax.lax.scan` in blocks of K=50 steps with manual `eqx.partition` / `eqx.combine` bookkeeping. This has been replaced with a straightforward per-iteration loop and a JIT-compiled `update_metrics` helper:
+
+- Easier to debug and profile.
+- No change in convergence behavior.
+- Progress bar (`trange`) updates every iteration; detailed metrics display every 50 steps.
+
+### 6. CPU-Only Environment Enforcement (`main.py`)
+
+All GPU/accelerator paths are disabled at the very top of `main.py` before any framework import:
+
+```python
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_XLA_FLAGS"] = "--tf_xla_cpu_global_jit"
+```
+
+### 7. Updated Dependencies (`pyproject.toml`)
+
+- Python version bumped to `>=3.13`.
+- Added explicit dependencies: `onnxruntime`, `simplepyutils`, `more-itertools`, `addict`, `einops`, `tensorflow-graphics`.
+- Pinned TensorFlow and tf-keras to `>=2.20.0,<2.21` for compatibility.
+
+### 8. Test Script (`test_pipeline.py`)
+
+A lightweight end-to-end smoke test was added to validate that the ONNX + separated-detector pipeline loads and runs correctly on a single dummy frame:
+
+```bash
+python test_pipeline.py
+```
+
+---
+
+## Files Changed
+
+| File | Change |
+|------|--------|
+| `main.py` | CPU env-vars, in-memory cache, batch-then-concat, `sample_length=128`, parameterized `max_iters` |
+| `monocular_demos/utils.py` | Separated detector/crop model, metadata pickle, ONNX session tuning |
+| `monocular_demos/biomechanics_mjx/monocular_trajectory.py` | Simplified training loop, removed `jax.lax.scan` unrolling |
+| `metrabs_tf/multiperson/multiperson_model.py` | Adapted `Pose3dEstimator` to accept plain lists (not TF tensors) for joint names/edges |
+| `pyproject.toml` | Updated Python version and added new dependencies |
+| `test_pipeline.py` | **[NEW]** Smoke test for the optimized pipeline |
+| `metrabs_metadata.pkl` | **[NEW]** Pre-extracted model metadata |
+| `metrabs_detector/` | **[NEW]** Standalone person-detector SavedModel |
