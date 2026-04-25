@@ -84,7 +84,13 @@ def video_reader(filename: str, batch_size: int = 8, width: int | None = None):
 def load_metrabs():
     if load_metrabs.model is not None:
         return load_metrabs.model
-    
+    import tensorflow as tf
+    load_metrabs.model = tf.saved_model.load("metrabs_eff")
+    import onnxruntime as ort
+    from metrabs_tf.multiperson.multiperson_model import Pose3dEstimator
+    import simplepyutils as spu
+    import pickle
+    import os
 
     print("Loading Metadata and Detector...")
     with open('metrabs_metadata.pkl', 'rb') as f:
